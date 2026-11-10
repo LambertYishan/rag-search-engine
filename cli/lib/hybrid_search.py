@@ -6,6 +6,7 @@ from .chunked_semantic_search import ChunkedSemanticSearch
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
+import re, time
 
 
 def correct_spelling(query: str) -> str:
@@ -84,6 +85,107 @@ def rewrite(query: str) -> str:
 
     return corrected_query.strip()
 
+def expand(query: str) -> str:
+    load_dotenv()
+    
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY environment variable not set")
+
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+
+    prompt = f"""Expand the user-provided movie search query below with related terms.
+
+    Add synonyms and related concepts that might appear in movie descriptions.
+    Keep expansions relevant and focused.
+    Output only the additional terms; they will be appended to the original query.
+
+    Examples:
+    - "scary bear movie" -> "scary horror grizzly bear movie terrifying film"
+    - "action movie with bear" -> "action thriller bear chase fight adventure"
+    - "comedy with bear" -> "comedy funny bear humor lighthearted"
+
+    User query: "{query}"
+    """
+
+    response = client.chat.completions.create(
+        model="openrouter/free",
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    corrected_query = response.choices[0].message.content
+
+    if not corrected_query:
+        return query
+
+    return corrected_query.strip()
+
+def rerank(results: list[dict], query: str) -> list[dict]:
+    load_dotenv()
+    
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY environment variable not set")
+
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+    
+    for i, result in enumerate(results):
+        
+        doc = result["document"]
+        
+        prompt = f"""Rate how well this movie matches the search query.
+
+        Query: "{query}"
+        Movie: {doc.get("title", "")} - {doc.get("description", "")}
+
+        Consider:
+        - Direct relevance to query
+        - User intent (what they're looking for)
+        - Content appropriateness
+
+        Rate 0-10 (10 = perfect match).
+        Output ONLY the number in your response, no other text or explanation.
+
+        Score:"""
+        
+        response = client.chat.completions.create(
+            model="openrouter/free",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        
+        response_text = response.choices[0].message.content
+        
+        if not response_text:
+            raise ValueError(f"Empty LLM response for document: {doc.get('title')}")
+
+        match = re.search(r"\b(?:10(?:\.0+)?|[0-9](?:\.\d+)?)\b", response_text)
+        
+        if not match:
+            raise ValueError(
+                f"Invalud rerankscore for {doc.get('title')}: {response_text}"
+            )
+        score = float(match.group())
+        
+        if not 0 <= score <= 10:
+            raise ValueError(f"Score outside 0-10 range: {score}")
+        
+        result["rerank_score"] = score
+        
+        if i <len(results) - 1:
+            time.sleep(3)
+        
+    return sorted(
+        results,
+        key=lambda result: result["rerank_score"],
+        reverse=True
+    )
+
 def normalize(scores:list) -> list:
     if not scores:
         return []
@@ -148,7 +250,7 @@ class HybridSearch:
             
             if doc_id not in combined_results:
                 combined_results[doc_id] = {
-                    "document": self.document[
+                    "document": self.documents[
                         next(
                             i for i, doc in enumerate(self.documents)
                             if doc["id"] == doc_id
@@ -211,7 +313,7 @@ class HybridSearch:
             reverse=True
         )
         
-        return sorted_results
+        return sorted_results[:limit]
     
 def normalize_command(scores: list[float]):
     if not scores:
@@ -240,7 +342,7 @@ def weighted_search_command(query, alpha, limit):
     results = engine.weighted_search(
         query,
         alpha,
-        limit * 500
+        limit
     )
 
     for i, result in enumerate(results[:limit], start=1):
@@ -257,42 +359,60 @@ def weighted_search_command(query, alpha, limit):
 def hybrid_score(bm25_score: float, semantic_score: float, alpha: float = 0.5) -> float:
     return alpha * bm25_score + (1 - alpha) * semantic_score
 
-def rrf_search_command(query, k, limit, enhance=None):
+def rrf_search_command(
+    query, k, limit, enhance=None, rerank_method=None
+):
     search_query = query
 
+    # Query enhancement
     if enhance == "spell":
         enhanced_query = correct_spelling(query)
-
-        if enhanced_query != query:
-            print(
-                f"Enhanced query ({enhance}): "
-                f"'{query}' -> '{enhanced_query}'\n"
-            )
-
-        search_query = enhanced_query
-
-    if enhance == "rewrite":
+    elif enhance == "rewrite":
         enhanced_query = rewrite(query)
+    elif enhance == "expand":
+        enhanced_query = expand(query)
+    else:
+        enhanced_query = query
 
-        if enhanced_query != query:
-            print(
-                f"Enhanced query ({enhance}): "
-                f"'{query}' -> '{enhanced_query}'\n"
-            )
+    if enhanced_query != query:
+        print(
+            f"Enhanced query ({enhance}): "
+            f"'{query}' -> '{enhanced_query}'\n"
+        )
 
+    search_query = enhanced_query
 
+    # Load documents and initialize search engine
     documents = load_movies()
     engine = HybridSearch(documents)
 
-    results = engine.rrf_search(search_query, k, limit)
+    # Retrieve 5x candidates when individual reranking is enabled
+    rerank_limit = (
+        limit * 5 if rerank_method == "individual" else limit
+    )
 
+    results = engine.rrf_search(search_query, k, rerank_limit)
+
+    # Apply LLM reranking
+    if rerank_method == "individual":
+        print(
+            f"Re-ranking top {len(results)} results "
+            "using individual method..."
+        )
+        results = rerank(results, search_query)
+
+    # Display only the requested number of results
     for i, result in enumerate(results[:limit], start=1):
         doc = result["document"]
-        print(f"{i}. {doc['title']}")
+
+        print(f"\n{i}. {doc['title']}")
+
+        if rerank_method == "individual":
+            print(f"  Re-rank Score: {result['rerank_score']:.3f}/10")
+
         print(f"  RRF Score: {result['rrf_score']:.3f}")
         print(
             f"  BM25 Rank: {result['bm25_rank']}, "
             f"Semantic Rank: {result['semantic_rank']}"
         )
         print(f"  {doc['description'][:100]}...")
-    
