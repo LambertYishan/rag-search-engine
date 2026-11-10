@@ -2,11 +2,13 @@ import os
 
 from .keyword_search import InvertedIndex, load_movies
 from .chunked_semantic_search import ChunkedSemanticSearch
+from sentence_transformers import CrossEncoder
 
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
 import re, time
+import json
 
 
 def correct_spelling(query: str) -> str:
@@ -122,10 +124,10 @@ def expand(query: str) -> str:
         return query
 
     return corrected_query.strip()
+def rerank(results: list[dict], query: str, method: str) -> list[dict]:
 
-def rerank(results: list[dict], query: str) -> list[dict]:
     load_dotenv()
-    
+
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY environment variable not set")
@@ -134,57 +136,170 @@ def rerank(results: list[dict], query: str) -> list[dict]:
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key,
     )
-    
-    for i, result in enumerate(results):
-        
-        doc = result["document"]
-        
-        prompt = f"""Rate how well this movie matches the search query.
+
+    if method == "individual":
+
+        for i, result in enumerate(results):
+            doc = result["document"]
+
+            prompt = f"""Rate how well this movie matches the search query.
+
+            Query: "{query}"
+            Movie: {doc.get("title", "")} - {doc.get("description", "")}
+
+            Consider:
+            - Direct relevance to query
+            - User intent (what they're looking for)
+            - Content appropriateness
+
+            Rate 0-10 (10 = perfect match).
+            Output ONLY the number in your response, no other text or explanation.
+
+            Score:"""
+
+            response = client.chat.completions.create(
+                model="openrouter/free",
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+            response_text = response.choices[0].message.content
+
+            if not response_text:
+                raise ValueError("Empty LLM response")
+
+            score_text = response_text.strip()
+
+            if not re.fullmatch(
+                r"(?:10(?:\.0+)?|[0-9](?:\.\d+)?)",
+                score_text
+            ):
+                raise ValueError(f"Invalid rerank score: {response_text}")
+
+            result["rerank_score"] = float(score_text)
+
+            if i < len(results) - 1:
+                time.sleep(3)
+
+        return sorted(
+            results,
+            key=lambda result: result["rerank_score"],
+            reverse=True
+        )
+
+    elif method == "batch":
+
+        doc_list = []
+
+        for result in results:
+            doc = result["document"]
+
+            doc_list.append(
+                f"ID: {doc['id']}\n"
+                f"Title: {doc['title']}\n"
+                f"Description: {doc['description']}"
+            )
+
+        doc_list_str = "\n\n".join(doc_list)
+
+        prompt = f"""Rank ALL movies listed below by relevance to the following search query.
 
         Query: "{query}"
-        Movie: {doc.get("title", "")} - {doc.get("description", "")}
 
-        Consider:
-        - Direct relevance to query
-        - User intent (what they're looking for)
-        - Content appropriateness
+        Movies:
+        {doc_list_str}
 
-        Rate 0-10 (10 = perfect match).
-        Output ONLY the number in your response, no other text or explanation.
+        IMPORTANT:
+        - Return EVERY movie ID listed above.
+        - Each movie ID must appear exactly once.
+        - Do not invent or omit any IDs.
+        - Return exactly {len(results)} movie IDs.
+        - Rank all movies from most relevant to least relevant.
 
-        Score:"""
-        
+        Your response must be a raw JSON array of integers.
+        Do not wrap the JSON in Markdown.
+        Do not include any explanatory text.
+
+        For example:
+        [75, 12, 34, 2, 1]
+
+        Ranking:"""
+
         response = client.chat.completions.create(
             model="openrouter/free",
             messages=[{"role": "user", "content": prompt}],
         )
-        
-        response_text = response.choices[0].message.content
-        
-        if not response_text:
-            raise ValueError(f"Empty LLM response for document: {doc.get('title')}")
 
-        match = re.search(r"\b(?:10(?:\.0+)?|[0-9](?:\.\d+)?)\b", response_text)
+        response_text = response.choices[0].message.content
+
+        if not response_text:
+            raise ValueError("Empty LLM response")
+
+        ranked_ids = json.loads(response_text.strip())
         
-        if not match:
+        candidate_ids = {
+            result["document"]["id"] for result in results
+        }
+
+        print("Raw response:", repr(response_text))
+        print("Expected IDs:", candidate_ids)
+        print("Returned IDs:", ranked_ids)
+        print("Missing:", candidate_ids - set(ranked_ids))
+        print("Unexpected:", set(ranked_ids) - candidate_ids)
+        print("Expected count:", len(candidate_ids))
+        print("Returned count:", len(ranked_ids))
+
+        # Validate the returned ranking
+        if not isinstance(ranked_ids, list):
+            raise ValueError("LLM response must be a JSON list")
+
+        candidate_ids = {
+            result["document"]["id"] for result in results
+        }
+
+        if (
+            len(ranked_ids) != len(candidate_ids)
+            or set(ranked_ids) != candidate_ids
+            or any(type(movie_id) is not int for movie_id in ranked_ids)
+        ):
             raise ValueError(
-                f"Invalud rerankscore for {doc.get('title')}: {response_text}"
+                "LLM returned missing, duplicate, or invalid movie IDs"
             )
-        score = float(match.group())
+
+        # Map movie IDs to their original result dictionaries
+        result_map = {
+            result["document"]["id"]: result
+            for result in results
+        }
+
+        # Preserve original metadata while changing the order
+        return [result_map[movie_id] for movie_id in ranked_ids]
+
+    elif method == "cross_encoder":
+        pairs = []
+
+        for result in results:
+            doc = result["document"]
+            pairs.append([
+                query,
+                f"{doc.get('title', '')} - {doc.get('description', '')}"
+            ])
         
-        if not 0 <= score <= 10:
-            raise ValueError(f"Score outside 0-10 range: {score}")
+        cross_encoder = CrossEncoder("cross-encoder/ms-marco-TinyBERT-L2-v2")
+        scores = cross_encoder.predict(pairs)
         
-        result["rerank_score"] = score
+        for result, score in zip(results, scores):
+            result["cross_encoder_score"] = float(score)
         
-        if i <len(results) - 1:
-            time.sleep(3)
+        return sorted(
+            results,
+            key=lambda result: result["cross_encoder_score"],
+            reverse=True
+        )
         
-    return sorted(
-        results,
-        key=lambda result: result["rerank_score"],
-        reverse=True
-    )
+        
+    
+    else:
+        raise ValueError(f"Unsupported reranking method: {method}")
 
 def normalize(scores:list) -> list:
     if not scores:
@@ -387,19 +502,18 @@ def rrf_search_command(
     engine = HybridSearch(documents)
 
     # Retrieve 5x candidates when individual reranking is enabled
-    rerank_limit = (
-        limit * 5 if rerank_method == "individual" else limit
-    )
+    rerank_limit = limit * 5 if rerank_method else limit
 
     results = engine.rrf_search(search_query, k, rerank_limit)
 
     # Apply LLM reranking
-    if rerank_method == "individual":
+    if rerank_method in ("individual", "batch", "cross_encoder"):
         print(
             f"Re-ranking top {len(results)} results "
-            "using individual method..."
+            f"using {rerank_method} method..."
         )
-        results = rerank(results, search_query)
+
+        results = rerank(results, search_query, rerank_method)
 
     # Display only the requested number of results
     for i, result in enumerate(results[:limit], start=1):
@@ -409,6 +523,9 @@ def rrf_search_command(
 
         if rerank_method == "individual":
             print(f"  Re-rank Score: {result['rerank_score']:.3f}/10")
+
+        if rerank_method == "cross_encoder":
+            print(f"  Cross Encoder Score: {result['cross_encoder_score']:.3f}")
 
         print(f"  RRF Score: {result['rrf_score']:.3f}")
         print(
